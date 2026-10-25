@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Write a word</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#e7ecf0; --ink:#000; --text:#1d2733; --muted:#5b6876; --accent:#2b59d9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:"Bricolage Grotesque", system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:48px 20px 64px; }
+  h1 { font-size:clamp(2rem, 6vw, 3.25rem); line-height:1.05; margin:0 0 12px; letter-spacing:-0.02em; }
+  p.lead { margin:0 0 28px; color:var(--muted); font-size:1.05rem; max-width:48ch; }
+  canvas { display:block; width:100%; aspect-ratio:800/260; background:#fff; border-radius:6px;
+           box-shadow:0 0 0 2px var(--text); touch-action:none; cursor:crosshair; }
+  .row { display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-top:20px; }
+  .result { font-size:clamp(2rem, 8vw, 3.5rem); font-weight:700; min-height:1.2em; word-break:break-all; }
+  .result.empty { color:var(--muted); font-weight:400; font-size:1.1rem; }
+  button { font:inherit; padding:10px 20px; border:0; border-radius:6px; background:var(--accent);
+           color:#fff; cursor:pointer; }
+  button:focus-visible { outline:3px solid var(--text); outline-offset:2px; }
+  .note { margin-top:28px; color:var(--muted); font-size:.95rem; max-width:56ch; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Write a word</h1>
+  <p class="lead">Draw one word in the box. It gets read when you pause.</p>
+
+  <canvas id="pad" width="800" height="260" aria-label="Drawing area"></canvas>
+
+  <div class="row">
+    <div id="result" class="result empty" aria-live="polite">Nothing drawn yet</div>
+    <button id="clear" type="button">Clear</button>
+  </div>
+  <p class="note">Works best with one lowercase or cursive word, written large enough to fill the box.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script>
+const pad = document.getElementById("pad");
+const ctx = pad.getContext("2d");
+const result = document.getElementById("result");
+let drawing = false, timer = null, last = null;
+
+function resetPad() {
+  ctx.fillStyle = "#fff";                       // exported PNG must not be transparent
+  ctx.fillRect(0, 0, pad.width, pad.height);
+  ctx.lineWidth = 7;
+  ctx.lineCap = ctx.lineJoin = "round";
+  ctx.strokeStyle = "#000";
+}
+resetPad();
+
+function pos(e) {
+  const r = pad.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * pad.width / r.width,
+           y: (e.clientY - r.top) * pad.height / r.height };
+}
+
+pad.addEventListener("pointerdown", e => {
+  pad.setPointerCapture(e.pointerId);
+  drawing = true; clearTimeout(timer);
+  last = pos(e);
+  ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(last.x + 0.01, last.y); ctx.stroke();
+});
+pad.addEventListener("pointermove", e => {
+  if (!drawing) return;
+  const p = pos(e);
+  ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+  last = p;
+});
+function stop() {
+  if (!drawing) return;
+  drawing = false;
+  timer = setTimeout(read, 700);                // read after a short pause
+}
+pad.addEventListener("pointerup", stop);
+pad.addEventListener("pointercancel", stop);
+
+const IMG_H = 64, IMG_W = 256, THRESH = 0.15, MARGIN = 8;   // must match training
+// No converter: the network is rebuilt here with the TF.js layers API and the
+// trained numbers are loaded from weights.bin (written by export_weights.py).
+function buildModel(numClasses) {
+  const L = tf.layers;
+  const input = tf.input({ shape: [IMG_H, IMG_W, 1] });
+  let x = input;
+  for (const [filters, pool] of [[32, [2, 2]], [64, [2, 2]], [128, [2, 1]]]) {
+    x = L.conv2d({ filters, kernelSize: 3, padding: "same", useBias: false }).apply(x);
+    x = L.batchNormalization({ epsilon: 1e-3 }).apply(x);
+    x = L.activation({ activation: "relu" }).apply(x);
+    x = L.maxPooling2d({ poolSize: pool }).apply(x);
+  }
+  x = L.permute({ dims: [2, 1, 3] }).apply(x);
+  x = L.reshape({ targetShape: [IMG_W / 4, (IMG_H / 8) * 128] }).apply(x);
+  x = L.dense({ units: 128, activation: "relu" }).apply(x);
+  for (let i = 0; i < 2; i++) {
+    x = L.bidirectional({
+      layer: L.lstm({ units: 128, returnSequences: true, recurrentActivation: "sigmoid", recurrentInitializer: "zeros" }),
+      mergeMode: "concat"
+    }).apply(x);
+  }
+  x = L.dense({ units: numClasses }).apply(x);
+  return tf.model({ inputs: input, outputs: x });
+}
+
+async function loadModel(numClasses) {
+  const [meta, buf, check] = await Promise.all([
+    fetch("weights.json").then(r => r.json()),
+    fetch("weights.bin").then(r => r.arrayBuffer()),
+    fetch("check.json").then(r => r.json())
+  ]);
+  const model = buildModel(numClasses);
+
+  // Read the exported numbers back as tensors, in export order.
+  let off = 0;
+  const tensors = meta.shapes.map(shape => {
+    const n = shape.reduce((p, q) => p * q, 1);
+    const t = tf.tensor(new Float32Array(buf, off * 4, n), shape);
+    off += n;
+    return t;
+  });
+
+  // Hand them out layer by layer. (model.weights lists batch-norm averages at the
+  // very end, so a single model.setWeights() would put them in the wrong slots.)
+  let idx = 0;
+  for (const layer of model.layers) {
+    const n = layer.weights.length;
+    if (!n) continue;
+    const part = tensors.slice(idx, idx + n);
+    idx += n;
+    const same = part.length === n &&
+      part.every((t, i) => t.shape.join("x") === layer.weights[i].shape.join("x"));
+    if (!same) {
+      throw new Error("Shape mismatch in layer " + layer.name +
+        "\nbrowser: " + layer.weights.map(w => w.shape.join("x")).join(", ") +
+        "\nexport:  " + part.map(t => t.shape.join("x")).join(", "));
+    }
+    layer.setWeights(part);
+  }
+  if (idx !== tensors.length) throw new Error("Unused weights: used " + idx + " of " + tensors.length);
+  tf.dispose(tensors);
+
+  // Sanity check against Python: output for an all-zero image should match.
+  const y = model.predict(tf.zeros([1, IMG_H, IMG_W, 1]));
+  const got = Array.from(y.slice([0, 0, 0], [1, 1, -1]).dataSync());
+  y.dispose();
+  const diff = Math.max(...got.map((v, i) => Math.abs(v - check.logits0[i])));
+  console.log("Max difference from Python output:", diff);
+  if (diff > 1e-2) console.warn("Browser model does not match the Python model. Differences:", diff);
+  return model;
+}
+
+const modelPromise = fetch("chars.json").then(r => r.json())
+  .then(async chars => [await loadModel(chars.length + 1), chars]);
+
+// Same steps as training: ink = 1 / paper = 0, tight crop, resize with padding.
+function preprocess() {
+  const { data, width, height } = ctx.getImageData(0, 0, pad.width, pad.height);
+  const ink = new Float32Array(width * height);
+  let x0 = width, x1 = -1, y0 = height, y1 = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const v = 1 - (data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / (3 * 255);
+      ink[i] = v;
+      if (v > THRESH) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) return null;                                  // blank canvas
+  x0 = Math.max(x0 - MARGIN, 0);          y0 = Math.max(y0 - MARGIN, 0);
+  x1 = Math.min(x1 + MARGIN, width - 1);  y1 = Math.min(y1 + MARGIN, height - 1);
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+
+  return tf.tidy(() => {
+    const crop = tf.tensor3d(ink, [height, width, 1]).slice([y0, x0, 0], [ch, cw, 1]);
+    const s = Math.min(IMG_H / ch, IMG_W / cw);
+    const nh = Math.max(1, Math.round(ch * s)), nw = Math.max(1, Math.round(cw * s));
+    const small = tf.image.resizeBilinear(crop, [nh, nw], false, true);   // half-pixel centers, like TF2
+    const top = Math.floor((IMG_H - nh) / 2), left = Math.floor((IMG_W - nw) / 2);
+    return small.pad([[top, IMG_H - nh - top], [left, IMG_W - nw - left], [0, 0]]).expandDims(0);
+  });
+}
+
+// Greedy CTC: best class per step, merge repeats, drop the blank (last class).
+function decode(logits, chars) {
+  const ids = logits.argMax(-1).dataSync();
+  let out = "", prev = -1;
+  for (const id of ids) {
+    if (id !== prev && id !== chars.length) out += chars[id];
+    prev = id;
+  }
+  return out;
+}
+
+async function read() {
+  try {
+    const [model, chars] = await modelPromise;
+    const x = preprocess();
+    if (!x) { result.textContent = "Nothing drawn yet"; result.classList.add("empty"); return; }
+    const logits = model.predict(x);
+    const text = decode(logits, chars);
+    tf.dispose([x, logits]);
+    result.textContent = text || "Couldn't read that. Try writing larger.";
+    result.classList.toggle("empty", !text);
+  } catch (err) {
+    console.error(err);
+    result.textContent = "The model didn't load. Open the browser console (F12) for details.";
+    result.classList.add("empty");
+  }
+}
+
+document.getElementById("clear").addEventListener("click", () => {
+  clearTimeout(timer); resetPad();
+  result.textContent = "Nothing drawn yet"; result.classList.add("empty");
+});
+</script>
+</body>
+</html>
