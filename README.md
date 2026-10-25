@@ -11,25 +11,15 @@ A machine learning model that extracts text from handwritten images. The model i
 5. **Output.** Each time step scores every character (79) plus a "blank" symbol.
 6. **CTC decoding.** The best character per step is taken, repeats are merged, and blanks are removed to produce the text.
 
-The split into training, validation, and test sets was random, so writers can appear in more than one set. Accuracy on a completely new writer, or on mouse-drawn input, is likely lower.
-
 ## Running in the browser
 
 The standard trained weights from the TensorFlow model are exported as raw files to be rebuilt in TensorFlow.js, then loaded layer by layer to run locally in the browser.
 
-## Run locally in /app
+## Run locally on http://localhost:8000/ in /app
 
 ```bash
 python -m http.server
 ```
-
-## Training
-
-Training was done on Google Colab with a GPU.
-
-1. Register for and download the IAM words dataset (`words.tgz`, `ascii.tgz`) from the [IAM Handwriting Database](https://fki.tic.unibe.ch/databases/iam-handwriting-database).
-2. Run `handwriting_crnn_ctc.py`: Adam optimizer, early stopping, and learning-rate reduction on plateau.
-3. Run `export_weights.py` to write `weights.bin`, `weights.json`, `check.json`, and `chars.json`.
 
 ## Credits
 
